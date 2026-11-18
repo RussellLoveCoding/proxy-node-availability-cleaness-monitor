@@ -93,41 +93,25 @@ ai_clean.py — AI 干净节点筛选器 v3 (Windows / 复用 Clash Verge Rev �
 #     订阅间 --sub-interval+抖动；do_unlock 服务间 0.4~1.2s 抖动；make_session 补浏览器头。
 #   - --help: build_parser() 分组+示例，是参数唯一定义入口；main 里只做校验。
 #
-# ■ TODO: IPQS IP纯净度(尚未实现! 要求做成"独立单元"，低耦合)
-#   目标: 节点出口IP → IPQualityScore 信誉(fraud_score/proxy/vpn/tor/滥用)。
+# ■ IP纯净度独立单元(已实现，低耦合，支持 IPQS + ipapi.is + AbuseIPDB)
+#   目标: 节点出口IP → IPQS(必须) + ipapi.is(可选, ASN/机房滥用率) + AbuseIPDB(可选,
+#         真实攻击举报) 综合评估纯净度，辅助筛选 T2/T3 高质量养号机房 IP。
 #   只记录+展示+导出；默认不封盘；绝不动 services/tier/sealed；不拉订阅。
-#   形态: 新增自包含区段 "==== IPQS 独立单元 ===="，建议函数:
-#     detect_exit_ip(sess,args) / query_ipqs(ip,key,args) / do_ip_purity(n,sess,args)
-#     / ipqs_pending(n,args) / show_ipqs(st)
+#   形态: 自包含区段 "==== IP 纯净度独立单元 ===="，核心函数:
+#     detect_local_ip() / detect_exit_ip(sess,args) / query_ipqs / query_ipapi /
+#     query_abuseipdb / do_ip_purity(n,sess,args) / ipqs_pending(n,args) /
+#     compute_purity(n) / show_ipqs(st,args)
 #   对既有代码的改动收敛为以下钩子，每处用 "# [IPQS]" 注释标记，便于审查/回退:
-#     H1 new_node/load_state: 补 "ip":{}, "ipqs":{} (setdefault 兼容)
-#     H2 needs_listener: 各分支 OR ipqs_pending(n,args)
-#     H3 worker: 末尾若 ipqs_pending 且有 port → do_ip_purity；新增 ipqs_only 分支
-#        (只跑 IPQS，跳过解锁与健康采样)
-#     H4 run_round: targets 在 --provider 之后、--limit 之前按 ipqs_only 过滤；
-#        ipqs_only 不 finalize；仅启用阈值封盘时才 emit(剔除新封盘节点)
-#     H5 main: key 校验(--ipqs-key 或环境变量 IPQS_KEY)与互斥检查
-#     H6 stability_rows 追加 exit_ip/ipqs_* 列；--status 与跑完时调 show_ipqs
-#     H7 build_parser: --ipqs / --ipqs-only / --ipqs-key / --ipqs-refresh /
-#        --ipqs-strictness / --ipqs-interval / --ipqs-block-above
-#   API: GET https://www.ipqualityscore.com/api/json/ip/{KEY}/{IP}
-#        ?strictness=1&allow_public_access_points=true&lighter_penalties=true
-#        strictness 0..3，官方建议 0/1(2+ 易误报)。响应关键字段: success/message/
-#        fraud_score(0-100 越低越干净)/proxy/vpn/tor/active_vpn/active_tor/
-#        recent_abuse/bot_status/is_crawler/mobile/connection_type/country_code/
-#        region/city/ISP/ASN/organization/host。success=false 且 message 含
-#        invalid/insufficient/exceeded → 本轮止损，不再浪费调用。
-#   取出口IP(走节点 listener，多源轮询防限频，缓存进 n["ip"]):
-#        cloudflare https://www.cloudflare.com/cdn-cgi/trace 解析 ^ip= 行 →
-#        ipify https://api.ipify.org?format=json → ipinfo https://ipinfo.io/json →
-#        ip-api http://ip-api.com/json/ (注意: IP 字段叫 query 不是 ip!)
-#   查询走直连 make_session(None)，不耗节点流量；全局 Lock 串行 + 最小间隔
-#   (--ipqs-interval 默认1.5s)；免费配额有限(约1000次/月，以账户为准) →
-#   默认跳过已查成功节点，--ipqs-refresh 才重查；配合 --limit 小批量试水。
-#   安全: key 只出现在请求 URL，绝不写日志/state。--ipqs-block-above 默认 None
-#   (只记录)；启用时 fraud_score>=N 或 tor/active_tor → block()。
-#   判读参考: ≤25 干净, 50~74 可疑, ≥75 高危；connection_type 免费档返回
-#   "Premium required." 属正常。
+#     H1 new_node/load_state: 补 "ip":{}, "ipqs":{}, "ipapi":{}, "abuseipdb":{} 与顶层 "ip_cache":{}
+#     H2 needs_listener: 各分支 OR needs_exit_ip_probe(n,args)
+#     H3 worker: 末尾若 args.ipqs 且 ipqs_pending → do_ip_purity；新增 ipqs_only 分支
+#     H4 run_round: targets 按 ipqs_only/min_tier 过滤；ipqs_only 不 finalize；
+#        仅启用 --ipqs-block-above 时才 emit
+#     H5 main: key 校验(--ipqs-key/IPQS_KEY, --ipapi-key/IPAPI_KEY, --abuseipdb-key/ABUSEIPDB_KEY)
+#     H6 stability_rows 追加 region_yt/exit_ip/ipqs_*/ipapi_*/abuse_*/purity_* 列；--status 与跑完时调 show_ipqs
+#     H7 build_parser: --ipqs* + --ipapi-key + --abuseipdb-key + --ipqs-min-tier
+#   查询走直连 make_session(None)，全局 Lock 串行 + 间隔控制 + 按出口 IP 全局去重缓存
+#   (st["ip_cache"])，不耗节点流量。安全: key 绝不写日志/state。
 #
 # ■ 陷阱与禁区(历史踩坑，勿"顺手修复")
 #   - refresh_subscriptions 先把所有节点 present=False 再按拉取结果回填:
@@ -139,9 +123,9 @@ ai_clean.py — AI 干净节点筛选器 v3 (Windows / 复用 Clash Verge Rev �
 #   - stability_only 不 finalize、不 emit；健康采样里送中封盘仅在非 stability_only 生效。
 #   - 内核整批拒绝 → run_batch 二分排障(budget=25)，单节点 kernel_fail>=3 才封盘。
 #   - apply_filters 空实现是用户明确要求；--min-stability/--region/--max-delay 预留未启用。
+#   - --exclude-provider 仅作用于输出/报告(emit/status/stats), 不排除测试/重置/finalize;
+#     订阅仍会拉取并入池, 定时任务安装时会原样带上该参数。
 #   - Windows 计划任务引号用 _psq；勿改 CREATE_NO_WINDOW；保持 Linux 分支可用。
-#   - 若 build_parser 已含 --ipqs* 参数但逻辑未实现: 这些是"哑参数"，
-#     --ipqs-only 会按普通轮跑(含解锁探测)! 实现前应在 main 加护栏直接报错退出。
 # ============================================================================
 
 from __future__ import annotations
@@ -698,6 +682,7 @@ def new_node(provider, orig, name, proxy) -> dict:
         "blocked": False, "blocked_reason": None, "blocked_at": None,
         "sealed": False, "tier": 0, "kernel_fail": 0, "last_google_ok": None,
         "region": {}, "services": {s: new_service() for s in SERVICES},
+        "ip": {}, "ipqs": {}, "ipapi": {}, "abuseipdb": {},   # [IPQS]
         "reach": {"samples": 0, "google_ok": 0, "link_samples": 0, "link_ok": 0,
                   "recent": [], "consecutive_fail": 0, "delay_last": None,
                   "delay_ewma": None, "last_ok_at": None},
@@ -710,6 +695,7 @@ def load_state(path: Path) -> dict:
             st = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(st, dict) and "nodes" in st:
                 st.setdefault("runs", [])
+                st.setdefault("ip_cache", {})         # [IPQS] 按出口IP全局去重缓存
                 for n in st["nodes"].values():        # 向后兼容补字段
                     for s in SERVICES:
                         n.setdefault("services", {}).setdefault(s, new_service())
@@ -717,10 +703,14 @@ def load_state(path: Path) -> dict:
                     n.setdefault("kernel_fail", 0)
                     n.setdefault("last_google_ok", None)
                     n.setdefault("sealed", False)
+                    n.setdefault("ip", {})            # [IPQS]
+                    n.setdefault("ipqs", {})          # [IPQS]
+                    n.setdefault("ipapi", {})         # [IPQS]
+                    n.setdefault("abuseipdb", {})     # [IPQS]
                 return st
         except Exception as e:
             console.print(f"[yellow]state 读取失败({e})，将新建[/yellow]")
-    return {"version": 3, "updated_at": None, "nodes": {}, "runs": []}
+    return {"version": 3, "updated_at": None, "nodes": {}, "runs": [], "ip_cache": {}}
 
 
 def save_state(st: dict, path: Path):
@@ -758,6 +748,11 @@ def block(n: dict, reason: str):
 
 def unlock_pending(n: dict) -> bool:
     return not n["blocked"] and not n["sealed"]
+
+
+def provider_excluded(n: dict, args) -> bool:
+    """--exclude-provider: 被排除机场的节点不输出/不进报告(测试与 state 照常)。"""
+    return n.get("provider") in (getattr(args, "exclude_providers", None) or ())
 
 
 def stability(n: dict, kind="google") -> Optional[float]:
@@ -1146,6 +1141,512 @@ PROBES = [("chatgpt", probe_chatgpt), ("youtube", probe_youtube),
           ("primevideo", probe_primevideo)]
 
 
+# ============================== IP 纯净度独立单元 ==============================
+# [IPQS] 自包含单元: 出口IP探测(防直连泄漏/飘移检测) + IPQS/ipapi.is/AbuseIPDB 多源查询
+_IP_API_LOCK = Lock()
+_IP_RUN_CTX: dict = {
+    "local_ip": None,
+    "cache": {},
+    "exhausted": {},
+    "refreshed": set(),
+    "last_at": {},
+}
+_EXHAUST_KWS = ("invalid", "insufficient", "exceeded", "limit", "quota",
+                "credit", "unauthorized", "forbidden", "expired", "key")
+
+
+def reset_ip_run_ctx(st: dict, args):
+    """每轮开始前重置内存态并探测一次本机直连 IP, 防止代理掉线走 DIRECT 误判。"""
+    _IP_RUN_CTX["cache"] = st.setdefault("ip_cache", {})
+    _IP_RUN_CTX["exhausted"] = {}
+    _IP_RUN_CTX["refreshed"] = set()
+    _IP_RUN_CTX["last_at"] = {}
+    _IP_RUN_CTX["local_ip"] = detect_local_ip(args)
+
+
+def _valid_public_ip(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    try:
+        obj = ipaddress.ip_address(str(raw).strip())
+    except ValueError:
+        return None
+    if (obj.is_private or obj.is_loopback or obj.is_link_local
+            or obj.is_multicast or obj.is_reserved or obj.is_unspecified):
+        return None
+    return str(obj)
+
+
+def detect_local_ip(args) -> Optional[str]:
+    """直连探测本机公网 IP, 作为代理泄漏防呆基线。"""
+    with make_session(None) as ds:
+        res = detect_exit_ip(ds, args, check_leak=False)
+        return res.get("addr") if res.get("ok") else None
+
+
+def detect_exit_ip(sess, args, check_leak: bool = True) -> dict:
+    """多源轮询获取节点真实出口 IP: cloudflare trace -> ipify -> ipinfo -> ip-api。"""
+    sources = [
+        ("cloudflare", "https://www.cloudflare.com/cdn-cgi/trace"),
+        ("ipify", "https://api.ipify.org?format=json"),
+        ("ipinfo", "https://ipinfo.io/json"),
+        ("ip-api", "http://ip-api.com/json/"),
+    ]
+    to = min(float(getattr(args, "timeout", 8) or 8), 6.0)
+    last_err = "unknown"
+    local_ip = _IP_RUN_CTX.get("local_ip") if check_leak else None
+    for src, url in sources:
+        r, err = http(sess, "GET", url, to, 0)
+        if err:
+            last_err = f"{src}:{err}"
+            continue
+        if r.status_code != 200:
+            last_err = f"{src}:HTTP{r.status_code}"
+            continue
+        raw_ip, cf_loc = None, ""
+        if src == "cloudflare":
+            txt = r.text or ""
+            m_ip = re.search(r"(?m)^ip=([^\s]+)", txt)
+            m_loc = re.search(r"(?m)^loc=([A-Za-z]{2})\b", txt)
+            raw_ip = m_ip.group(1) if m_ip else None
+            cf_loc = m_loc.group(1).upper() if m_loc else ""
+        else:
+            try:
+                j = r.json()
+            except Exception:
+                last_err = f"{src}:bad_json"
+                continue
+            raw_ip = j.get("query") if src == "ip-api" else j.get("ip")
+        ip_addr = _valid_public_ip(raw_ip)
+        if not ip_addr:
+            last_err = f"{src}:invalid_ip"
+            continue
+        if local_ip and ip_addr == local_ip:
+            last_err = "直连泄漏(exit_ip==local_ip)"
+            log(f"IP-LEAK {src}: {ip_addr}")
+            return {"ok": False, "addr": None, "source": src, "cf_loc": "",
+                    "at": now_str(), "err": last_err}
+        return {"ok": True, "addr": ip_addr, "source": src, "cf_loc": cf_loc,
+                "at": now_str(), "err": None}
+    return {"ok": False, "addr": None, "source": "", "cf_loc": "",
+            "at": now_str(), "err": last_err}
+
+
+def _update_node_ip(n: dict, res: dict):
+    prev = dict(n.get("ip") or {})
+    if not res.get("ok"):
+        prev["err"] = res.get("err")
+        prev["at"] = res.get("at")
+        n["ip"] = prev
+        return
+    hist = list(prev.get("history") or [])
+    changes = int(prev.get("changes") or 0)
+    old_addr, new_addr = prev.get("addr"), res["addr"]
+    if old_addr and old_addr != new_addr:
+        changes += 1
+    if not hist or hist[-1] != new_addr:
+        hist.append(new_addr)
+        hist = hist[-10:]
+    n["ip"] = {
+        "addr": new_addr, "source": res["source"], "cf_loc": res.get("cf_loc") or "",
+        "at": res["at"], "history": hist, "changes": changes, "err": None,
+    }
+
+
+def _parse_abuser_score(val) -> tuple[Optional[float], str]:
+    if val is None or val == "":
+        return None, ""
+    if isinstance(val, (int, float)):
+        return float(val), ""
+    m = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(?:\(([^)]+)\))?", str(val))
+    if not m:
+        return None, str(val).strip()
+    return float(m.group(1)), (m.group(2) or "").strip()
+
+
+def _is_exhausted_msg(status: int, msg: str) -> bool:
+    if status in (401, 402, 403, 429):
+        return True
+    low = (msg or "").lower()
+    return any(kw in low for kw in _EXHAUST_KWS)
+
+
+def _fetch_ipqs(ip: str, args, ds) -> tuple[dict, bool]:
+    url = f"https://www.ipqualityscore.com/api/json/ip/{args.ipqs_key}/{ip}"
+    params = {"strictness": args.ipqs_strictness,
+              "allow_public_access_points": "true", "lighter_penalties": "true"}
+    try:
+        r = ds.get(url, params=params, timeout=(5, max(args.timeout, 10)))
+    except requests.RequestException as e:
+        return {"ok": False, "ip": ip, "at": now_str(), "err": type(e).__name__}, False
+    try:
+        j = r.json()
+    except Exception:
+        return {"ok": False, "ip": ip, "at": now_str(), "err": f"HTTP{r.status_code}:bad_json"}, r.status_code in (401, 402, 403, 429)
+    if r.status_code != 200 or not j.get("success"):
+        msg = str(j.get("message") or f"HTTP{r.status_code}")
+        return {"ok": False, "ip": ip, "at": now_str(), "err": msg}, _is_exhausted_msg(r.status_code, msg)
+    return {
+        "ok": True, "ip": ip, "at": now_str(), "err": None,
+        "strictness": args.ipqs_strictness,
+        "fraud_score": j.get("fraud_score"),
+        "proxy": bool(j.get("proxy")),
+        "vpn": bool(j.get("vpn")),
+        "tor": bool(j.get("tor")),
+        "active_vpn": bool(j.get("active_vpn")),
+        "active_tor": bool(j.get("active_tor")),
+        "recent_abuse": bool(j.get("recent_abuse")),
+        "bot_status": bool(j.get("bot_status")),
+        "is_crawler": bool(j.get("is_crawler")),
+        "mobile": bool(j.get("mobile")),
+        "connection_type": j.get("connection_type") or "",
+        "country_code": (j.get("country_code") or "").upper(),
+        "region": j.get("region") or "",
+        "city": j.get("city") or "",
+        "ISP": j.get("ISP") or "",
+        "ASN": j.get("ASN"),
+        "organization": j.get("organization") or "",
+        "host": j.get("host") or "",
+    }, False
+
+
+def _fetch_ipapi(ip: str, args, ds) -> tuple[dict, bool]:
+    try:
+        r = ds.get("https://api.ipapi.is/", params={"q": ip, "key": args.ipapi_key},
+                   timeout=(5, max(args.timeout, 10)))
+    except requests.RequestException as e:
+        return {"ok": False, "ip": ip, "at": now_str(), "err": type(e).__name__}, False
+    try:
+        j = r.json()
+    except Exception:
+        return {"ok": False, "ip": ip, "at": now_str(), "err": f"HTTP{r.status_code}:bad_json"}, r.status_code in (401, 402, 403, 429)
+    if r.status_code != 200 or j.get("error"):
+        msg = str(j.get("error") or f"HTTP{r.status_code}")
+        return {"ok": False, "ip": ip, "at": now_str(), "err": msg}, _is_exhausted_msg(r.status_code, msg)
+    comp = j.get("company") if isinstance(j.get("company"), dict) else {}
+    asn = j.get("asn") if isinstance(j.get("asn"), dict) else {}
+    loc = j.get("location") if isinstance(j.get("location"), dict) else {}
+    co_score, co_label = _parse_abuser_score(comp.get("abuser_score"))
+    asn_score, asn_label = _parse_abuser_score(asn.get("abuser_score"))
+    return {
+        "ok": True, "ip": ip, "at": now_str(), "err": None,
+        "is_datacenter": bool(j.get("is_datacenter")),
+        "is_vpn": bool(j.get("is_vpn")),
+        "is_proxy": bool(j.get("is_proxy")),
+        "is_tor": bool(j.get("is_tor")),
+        "is_abuser": bool(j.get("is_abuser")),
+        "is_mobile": bool(j.get("is_mobile")),
+        "is_crawler": bool(j.get("is_crawler")),
+        "company_name": comp.get("name") or "",
+        "company_type": (comp.get("type") or "").lower(),
+        "company_abuser_score": co_score,
+        "company_abuser_label": co_label,
+        "asn": asn.get("asn"),
+        "asn_org": asn.get("org") or "",
+        "asn_type": (asn.get("type") or "").lower(),
+        "asn_abuser_score": asn_score,
+        "asn_abuser_label": asn_label,
+        "country_code": (loc.get("country_code") or "").upper(),
+    }, False
+
+
+def _fetch_abuseipdb(ip: str, args, ds) -> tuple[dict, bool]:
+    headers = {"Key": args.abuseipdb_key, "Accept": "application/json"}
+    params = {"ipAddress": ip, "maxAgeInDays": 90}
+    try:
+        r = ds.get("https://api.abuseipdb.com/api/v2/check", headers=headers,
+                   params=params, timeout=(5, max(args.timeout, 10)))
+    except requests.RequestException as e:
+        return {"ok": False, "ip": ip, "at": now_str(), "err": type(e).__name__}, False
+    try:
+        j = r.json()
+    except Exception:
+        return {"ok": False, "ip": ip, "at": now_str(), "err": f"HTTP{r.status_code}:bad_json"}, r.status_code in (401, 402, 403, 429)
+    if r.status_code != 200 or j.get("errors"):
+        errs = j.get("errors") or []
+        msg = "; ".join(str(x.get("detail") or x) for x in errs if isinstance(x, dict)) or f"HTTP{r.status_code}"
+        return {"ok": False, "ip": ip, "at": now_str(), "err": msg}, _is_exhausted_msg(r.status_code, msg)
+    d = j.get("data") if isinstance(j.get("data"), dict) else {}
+    return {
+        "ok": True, "ip": ip, "at": now_str(), "err": None,
+        "abuse_score": d.get("abuseConfidenceScore"),
+        "total_reports": d.get("totalReports", 0),
+        "distinct_users": d.get("numDistinctUsers", 0),
+        "last_reported_at": d.get("lastReportedAt") or "",
+        "usage_type": d.get("usageType") or "",
+        "isp": d.get("isp") or "",
+        "domain": d.get("domain") or "",
+        "is_tor": bool(d.get("isTor")),
+        "country_code": (d.get("countryCode") or "").upper(),
+    }, False
+
+
+_IP_BACKENDS = {
+    "ipqs": (_fetch_ipqs, lambda a: bool(getattr(a, "ipqs_key", None))),
+    "ipapi": (_fetch_ipapi, lambda a: bool(getattr(a, "ipapi_key", None))),
+    "abuseipdb": (_fetch_abuseipdb, lambda a: bool(getattr(a, "abuseipdb_key", None))),
+}
+
+
+def _cached_ip_lookup(svc: str, ip: str, args, interval: float) -> Optional[dict]:
+    """直连查询某项 IP 情报: 全局 Lock 串行 + 间隔限速 + 按 IP 全局缓存 + 本轮止损。"""
+    fetcher, _ = _IP_BACKENDS[svc]
+    with _IP_API_LOCK:
+        cache = _IP_RUN_CTX["cache"].setdefault(ip, {})
+        cached = cache.get(svc)
+        refreshed = _IP_RUN_CTX["refreshed"]
+        reuse = (isinstance(cached, dict) and cached.get("ok") is True
+                 and (not getattr(args, "ipqs_refresh", False) or (svc, ip) in refreshed))
+        if reuse:
+            return dict(cached)
+        if svc in _IP_RUN_CTX["exhausted"]:
+            return None
+        last = _IP_RUN_CTX["last_at"].get(svc, 0.0)
+        wait = interval - (time.time() - last)
+        if wait > 0:
+            time.sleep(wait)
+        with make_session(None) as ds:
+            res, fatal = fetcher(ip, args, ds)
+        _IP_RUN_CTX["last_at"][svc] = time.time()
+        if res.get("ok"):
+            cache[svc] = res
+            refreshed.add((svc, ip))
+            log(f"{svc.upper()} {ip} -> ok")
+        else:
+            log(f"{svc.upper()}-ERR {ip}: {res.get('err')}")
+            if fatal:
+                _IP_RUN_CTX["exhausted"][svc] = res.get("err") or "exhausted"
+                console.print(f"[yellow]⚠ {svc} 止损(密钥/配额异常): {res.get('err')}[/yellow]")
+        return res
+
+
+def ipqs_eligible(n: dict, args) -> bool:
+    return not n.get("blocked") and n.get("tier", 0) >= getattr(args, "ipqs_min_tier", 0)
+
+
+def ipqs_pending(n: dict, args) -> bool:
+    if not ipqs_eligible(n, args):
+        return False
+    if getattr(args, "ipqs_refresh", False):
+        return True
+    addr = (n.get("ip") or {}).get("addr")
+    if not addr:
+        return True
+    for svc, (_, has_key) in _IP_BACKENDS.items():
+        if has_key(args):
+            cur = n.get(svc) or {}
+            if not cur.get("ok") or cur.get("ip") != addr:
+                return True
+    return False
+
+
+def needs_exit_ip_probe(n: dict, args) -> bool:
+    return bool(getattr(args, "ipqs", False) and ipqs_pending(n, args)
+                and (getattr(args, "ipqs_refresh", False) or not (n.get("ip") or {}).get("addr")))
+
+
+def maybe_ipqs_block(n: dict, args) -> bool:
+    lim = getattr(args, "ipqs_block_above", None)
+    if lim is None or n.get("blocked"):
+        return False
+    ipqs = n.get("ipqs") or {}
+    if not ipqs.get("ok"):
+        return False
+    fs = ipqs.get("fraud_score")
+    tor = bool(ipqs.get("tor") or ipqs.get("active_tor"))
+    if tor or (fs is not None and fs >= lim):
+        block(n, f"IPQS高危(score={fs}, tor={tor})")
+        return True
+    return False
+
+
+def do_ip_purity(n: dict, sess, args):
+    """独立单元主入口: 取出口 IP(如需) + 直连补齐 IPQS/ipapi.is/AbuseIPDB。"""
+    if not ipqs_eligible(n, args):
+        return
+    need_probe = getattr(args, "ipqs_refresh", False) or not (n.get("ip") or {}).get("addr")
+    if need_probe:
+        if not n.get("port"):
+            return
+        res = detect_exit_ip(sess, args, check_leak=True)
+        _update_node_ip(n, res)
+        if not res.get("ok"):
+            log(f"EXIT-IP-FAIL {n['name']}: {res.get('err')}")
+            return
+        log(f"EXIT-IP {n['name']} -> {res['addr']} ({res['source']} loc={res.get('cf_loc') or '-'})")
+
+    ip_addr = (n.get("ip") or {}).get("addr")
+    if not ip_addr:
+        return
+    for svc, (_, has_key) in _IP_BACKENDS.items():
+        if not has_key(args):
+            continue
+        cur = n.get(svc) or {}
+        if cur.get("ok") and cur.get("ip") == ip_addr and not getattr(args, "ipqs_refresh", False):
+            continue
+        gap = args.ipqs_interval if svc == "ipqs" else min(float(args.ipqs_interval), 0.35)
+        res = _cached_ip_lookup(svc, ip_addr, args, gap)
+        if res is not None and (res.get("ok") or not cur.get("ok")):
+            n[svc] = res
+    maybe_ipqs_block(n, args)
+
+
+def compute_purity(n: dict) -> dict:
+    """汇总 IPQS + ipapi.is + AbuseIPDB + 出口稳定性，输出综合评级(S/A/B/C/D)与告警标签。"""
+    ip_info = n.get("ip") or {}
+    ipqs = n.get("ipqs") or {}
+    ipapi = n.get("ipapi") or {}
+    abuse = n.get("abuseipdb") or {}
+    iq_ok = bool(ipqs.get("ok"))
+    ia_ok = bool(ipapi.get("ok"))
+    ab_ok = bool(abuse.get("ok"))
+    if not (iq_ok or ia_ok or ab_ok):
+        return {"grade": "", "flags": []}
+
+    flags: list[str] = []
+    changes = int(ip_info.get("changes") or 0)
+    if changes > 0:
+        flags.append(f"出口飘移×{changes}")
+    cf_loc = (ip_info.get("cf_loc") or "").upper()
+    yt_reg = (n.get("region", {}).get("youtube") or "").upper()
+    split_route = bool(cf_loc and yt_reg and cf_loc != yt_reg)
+    if split_route:
+        flags.append(f"分流({cf_loc}/{yt_reg})")
+
+    fs = ipqs.get("fraud_score") if iq_ok else None
+    iq_tor = bool(iq_ok and (ipqs.get("tor") or ipqs.get("active_tor")))
+    iq_vpn = bool(iq_ok and (ipqs.get("vpn") or ipqs.get("active_vpn")))
+    iq_proxy = bool(iq_ok and ipqs.get("proxy"))
+    iq_abuse = bool(iq_ok and ipqs.get("recent_abuse"))
+    iq_bot = bool(iq_ok and ipqs.get("bot_status"))
+    if iq_ok:
+        if fs is not None and fs >= 26:
+            flags.append(f"IPQS:{fs}")
+        for cond, lbl in ((iq_tor, "tor"), (iq_vpn, "vpn"), (iq_proxy, "proxy"),
+                          (iq_abuse, "abuse"), (iq_bot, "bot")):
+            if cond:
+                flags.append(lbl)
+
+    max_ab = None
+    ia_isp_clean = False
+    if ia_ok:
+        asn_ab, co_ab = ipapi.get("asn_abuser_score"), ipapi.get("company_abuser_score")
+        vals = [x for x in (asn_ab, co_ab) if x is not None]
+        max_ab = max(vals) if vals else None
+        for cond, lbl in ((ipapi.get("is_tor"), "ipapi:tor"),
+                          (ipapi.get("is_abuser"), "ipapi:abuser"),
+                          (ipapi.get("is_vpn"), "ipapi:vpn"),
+                          (ipapi.get("is_proxy"), "ipapi:proxy")):
+            if cond:
+                flags.append(lbl)
+        if max_ab is not None and max_ab >= 0.1:
+            flags.append(f"ASN高滥用({max_ab:.2f})")
+        elif max_ab is not None and max_ab >= 0.02:
+            flags.append(f"ASN中滥用({max_ab:.3f})")
+        if ipapi.get("company_type") == "isp" and not ipapi.get("is_datacenter"):
+            ia_isp_clean = True
+            flags.append("ISP原生")
+
+    ab_score = abuse.get("abuse_score") if ab_ok else None
+    ab_rep = int(abuse.get("total_reports") or 0) if ab_ok else 0
+    if ab_ok:
+        if ab_score is not None and ab_score > 0:
+            flags.append(f"Abuse:{ab_score}%")
+        if ab_rep > 0:
+            flags.append(f"举报×{ab_rep}")
+
+    fs_v = fs if fs is not None else 0
+    ab_v = ab_score if ab_score is not None else 0
+    if (iq_ok and (iq_tor or fs_v >= 75 or (iq_abuse and fs_v >= 50))) \
+            or (ab_ok and (ab_v >= 25 or ab_rep >= 10)) \
+            or (ia_ok and (ipapi.get("is_tor") or (ipapi.get("is_abuser") and (max_ab or 0) >= 0.1))):
+        grade = "D"
+    elif (iq_ok and (fs_v >= 50 or iq_abuse or iq_bot)) \
+            or (ia_ok and (ipapi.get("is_abuser") or (max_ab is not None and max_ab >= 0.1))) \
+            or (ab_ok and (ab_v > 0 or ab_rep >= 3)) \
+            or (iq_vpn and ia_ok and ipapi.get("is_vpn")):
+        grade = "C"
+    elif (iq_ok and (fs_v >= 26 or iq_vpn or iq_proxy)) \
+            or (ia_ok and (ipapi.get("is_vpn") or ipapi.get("is_proxy") or (max_ab is not None and max_ab >= 0.02))) \
+            or (ab_ok and ab_rep > 0) or changes > 0 or split_route:
+        grade = "B"
+    elif (not iq_ok or fs_v <= 5) and n.get("tier", 0) >= 2 \
+            and (not ia_ok or ia_isp_clean or (max_ab is not None and max_ab < 0.005)):
+        grade = "S"
+    else:
+        grade = "A"
+    return {"grade": grade, "flags": flags}
+
+
+def any_ip_purity_data(st: dict) -> bool:
+    return any((n.get("ip") or {}).get("addr") or (n.get("ipqs") or {}).get("ok")
+               or (n.get("ipapi") or {}).get("ok") or (n.get("abuseipdb") or {}).get("ok")
+               for n in st.get("nodes", {}).values())
+
+
+def show_ipqs(st: dict, args):
+    nodes = [n for n in st["nodes"].values()
+             if n.get("present") and not provider_excluded(n, args)]
+    tested = [n for n in nodes if (n.get("ip") or {}).get("addr")
+              or (n.get("ipqs") or {}).get("ok")
+              or (n.get("ipapi") or {}).get("ok")
+              or (n.get("abuseipdb") or {}).get("ok")]
+    if not tested:
+        if getattr(args, "ipqs", False):
+            console.print("[dim]暂无 IP 纯净度数据[/dim]")
+        return
+
+    uniq_ips = {(n.get("ip") or {}).get("addr") for n in tested if (n.get("ip") or {}).get("addr")}
+    g_cnt = {g: 0 for g in ("S", "A", "B", "C", "D")}
+    for n in tested:
+        g = compute_purity(n)["grade"]
+        if g in g_cnt:
+            g_cnt[g] += 1
+    console.print(f"[cyan]IP 纯净度汇总[/cyan]：已测 {len(tested)} 节点 ({len(uniq_ips)} 唯一出口IP) | "
+                  + " ".join(f"{k}:{v}" for k, v in g_cnt.items()))
+
+    rank_map = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4, "": 5}
+    scored = []
+    for n in tested:
+        pu = compute_purity(n)
+        iq = n.get("ipqs") or {}
+        ia = n.get("ipapi") or {}
+        ab = n.get("abuseipdb") or {}
+        key = (
+            rank_map.get(pu["grade"], 5),
+            -n.get("tier", 0),
+            iq.get("fraud_score") if iq.get("ok") and iq.get("fraud_score") is not None else 999,
+            ab.get("abuse_score") if ab.get("ok") and ab.get("abuse_score") is not None else 999,
+            ia.get("asn_abuser_score") if ia.get("ok") and ia.get("asn_abuser_score") is not None else 999,
+            n["name"],
+        )
+        scored.append((key, n, pu))
+    scored.sort(key=lambda x: x[0])
+
+    t = Table(title="Top 25 IP 纯净度排行 (评级↓, Tier↓, IPQS↑)", box=box.SIMPLE)
+    for c in ("节点", "档", "地区", "出口IP", "级", "IPQS", "ASN滥用", "Abuse", "备注"):
+        t.add_column(c, no_wrap=(c in ("档", "地区", "出口IP", "级", "IPQS", "Abuse")))
+    for _, n, pu in scored[:25]:
+        ip_info = n.get("ip") or {}
+        iq = n.get("ipqs") or {}
+        ia = n.get("ipapi") or {}
+        ab = n.get("abuseipdb") or {}
+        yt_r = n.get("region", {}).get("youtube") or "-"
+        cf_r = ip_info.get("cf_loc") or "-"
+        iq_s = str(iq.get("fraud_score")) if iq.get("ok") else "-"
+        ia_s = (f"{ia['asn_abuser_score']:.3f}({ia.get('company_type') or '-'})"
+                if ia.get("ok") and ia.get("asn_abuser_score") is not None
+                else (ia.get("company_type") or "-" if ia.get("ok") else "-"))
+        ab_s = (f"{ab.get('abuse_score')}%/{ab.get('total_reports', 0)}"
+                if ab.get("ok") else "-")
+        t.add_row(
+            n["name"][:40], f"T{n['tier']}", f"{yt_r}/{cf_r}",
+            ip_info.get("addr") or "-", pu["grade"] or "-",
+            iq_s, ia_s, ab_s, ", ".join(pu["flags"])[:36] or "-",
+        )
+    console.print(t)
+
+
 # ============================== 解锁状态机(增量) ==============================
 def do_unlock(n: dict, sess, args):
     sv = n["services"]
@@ -1251,11 +1752,18 @@ def worker(n: dict, args, ctrl: int, secret: str) -> dict:
     try:
         if args.stability_only:
             health_sample(n, sess, args, ctrl, secret)
+            if getattr(args, "ipqs", False) and ipqs_pending(n, args):   # [IPQS]
+                do_ip_purity(n, sess, args)
+        elif getattr(args, "ipqs_only", False):                           # [IPQS]
+            if ipqs_pending(n, args):
+                do_ip_purity(n, sess, args)
         else:
             if unlock_pending(n) and n.get("port"):
                 do_unlock(n, sess, args)
             if not n["blocked"] and not args.no_stability_sample:
                 health_sample(n, sess, args, ctrl, secret)
+            if getattr(args, "ipqs", False) and ipqs_pending(n, args):   # [IPQS]
+                do_ip_purity(n, sess, args)
     except Exception as e:
         log(f"WORKER-ERR {n['name']}: {type(e).__name__} {e}")
     finally:
@@ -1269,12 +1777,21 @@ def worker(n: dict, args, ctrl: int, secret: str) -> dict:
 def needs_listener(n: dict, args) -> bool:
     if args.stability_only:
         # 204 走控制API不需要listener；只有上轮失败的节点才需要listener补Apple区分死/送中
-        return n.get("last_google_ok") is False
-    return unlock_pending(n) or n.get("last_google_ok") is False
+        return n.get("last_google_ok") is False or needs_exit_ip_probe(n, args)   # [IPQS]
+    if getattr(args, "ipqs_only", False):                                          # [IPQS]
+        return needs_exit_ip_probe(n, args)
+    return (unlock_pending(n) or n.get("last_google_ok") is False
+            or needs_exit_ip_probe(n, args))                                       # [IPQS]
 
 def run_batch_once(nodes: list[dict], args, exe: Path, workdir: Path, on_done):
     #  need = [n for n in nodes if needs_listener(n)]
     need = [n for n in nodes if needs_listener(n, args)]
+    if getattr(args, "ipqs_only", False) and not need:    # [IPQS] 已有出口IP仅补直连查询时免起内核
+        with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            futs = [ex.submit(worker, n, args, 0, "") for n in nodes]
+            for f in as_completed(futs):
+                on_done(f.result())
+        return
     ports = alloc_ports(len(need) + 1)
     ctrl, secret = ports[0], rand_secret()
     for n, p in zip(need, ports[1:]):
@@ -1339,7 +1856,8 @@ def ordered_proxy(p: dict) -> dict:
 
 def emit(st: dict, tiers: list[int], outdir: Path, args) -> dict:
     written = {}
-    nodes = [n for n in st["nodes"].values() if n["present"] and not n["blocked"]]
+    nodes = [n for n in st["nodes"].values()
+             if n["present"] and not n["blocked"] and not provider_excluded(n, args)]
     for t in tiers:
         pool = [n for n in nodes if n["tier"] >= t]
         pool = apply_filters(pool, args)
@@ -1360,9 +1878,12 @@ def emit(st: dict, tiers: list[int], outdir: Path, args) -> dict:
 
 # ============================== 汇总展示 ==============================
 def show_status(st: dict, args):
-    nodes = [n for n in st["nodes"].values() if n["present"]]
+    nodes = [n for n in st["nodes"].values()
+             if n["present"] and not provider_excluded(n, args)]
+    if args.exclude_providers:
+        console.print(f"[dim]报告已排除机场: {','.join(args.exclude_providers)}[/dim]")
     if not nodes:
-        console.print("[yellow]state 中没有在场节点[/yellow]")
+        console.print("[yellow]state 中没有可展示的在场节点(可能全部被排除)[/yellow]")
         return
     t = Table(title=f"节点总览 (state 更新于 {st.get('updated_at')})", box=box.SIMPLE_HEAVY)
     for c in ("机场", "在场", "T1", "T2", "T3", "待定", "封盘", "均延迟"):
@@ -1430,16 +1951,24 @@ def show_status(st: dict, args):
         console.print("[dim]封盘原因: " + ", ".join(f"{k}×{v}" for k, v in
                                                   sorted(reasons.items(), key=lambda x: -x[1])) + "[/dim]")
 
-def stability_rows(st: dict) -> list[dict]:
+def stability_rows(st: dict, args) -> list[dict]:
     rows = []
     for n in st["nodes"].values():
-        if not n.get("present"):
+        if not n.get("present") or provider_excluded(n, args):
             continue
         r = n["reach"]
         g, rec, link = stability(n), stability_recent(n), stability(n, "link")
+        ip_info = n.get("ip") or {}                     # [IPQS]
+        iq = n.get("ipqs") or {}
+        ia = n.get("ipapi") or {}
+        ab = n.get("abuseipdb") or {}
+        pu = compute_purity(n)
+        iq_flags = ",".join(k for k in ("proxy", "vpn", "active_vpn", "tor", "active_tor", "recent_abuse", "bot_status") if iq.get(k))
+        ia_flags = ",".join(k for k in ("is_abuser", "is_vpn", "is_proxy", "is_tor") if ia.get(k))
         rows.append({
             "provider": n["provider"], "name": n["name"],
             "region": n["region"].get("apple") or "",
+            "region_yt": n["region"].get("youtube") or "",  # [IPQS]
             "tier": n["tier"], "blocked": int(n["blocked"]),
             "samples": r["samples"], "google_ok": r["google_ok"],
             "google_rate": round(g, 4) if g is not None else "",
@@ -1450,13 +1979,29 @@ def stability_rows(st: dict) -> list[dict]:
             "consecutive_fail": r["consecutive_fail"],
             "last_google_ok": "" if n["last_google_ok"] is None else int(n["last_google_ok"]),
             "last_ok_at": r["last_ok_at"] or "", "last_seen": n["last_seen"],
+            "exit_ip": ip_info.get("addr") or "",           # [IPQS]
+            "exit_cf_loc": ip_info.get("cf_loc") or "",
+            "exit_ip_changes": ip_info.get("changes", 0) if ip_info.get("addr") else "",
+            "ipqs_score": iq.get("fraud_score") if iq.get("ok") and iq.get("fraud_score") is not None else "",
+            "ipqs_flags": iq_flags if iq.get("ok") else "",
+            "ipqs_isp": iq.get("ISP") or "" if iq.get("ok") else "",
+            "ipqs_asn": iq.get("ASN") if iq.get("ok") and iq.get("ASN") is not None else "",
+            "ipapi_dc": int(bool(ia.get("is_datacenter"))) if ia.get("ok") else "",
+            "ipapi_type": ia.get("company_type") or "" if ia.get("ok") else "",
+            "ipapi_asn_abuse": ia.get("asn_abuser_score") if ia.get("ok") and ia.get("asn_abuser_score") is not None else "",
+            "ipapi_co_abuse": ia.get("company_abuser_score") if ia.get("ok") and ia.get("company_abuser_score") is not None else "",
+            "ipapi_flags": ia_flags if ia.get("ok") else "",
+            "abuse_score": ab.get("abuse_score") if ab.get("ok") and ab.get("abuse_score") is not None else "",
+            "abuse_reports": ab.get("total_reports") if ab.get("ok") and ab.get("total_reports") is not None else "",
+            "purity_grade": pu["grade"],
+            "purity_notes": "; ".join(pu["flags"]),
         })
     rows.sort(key=lambda x: (x["provider"], x["name"]))
     return rows
 
 
-def dump_stats(st: dict, path: Path):
-    rows = stability_rows(st)
+def dump_stats(st: dict, path: Path, args):
+    rows = stability_rows(st, args)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix.lower() == ".csv":
         import csv
@@ -1471,10 +2016,11 @@ def dump_stats(st: dict, path: Path):
     console.print(f"[green]统计已导出[/green] {len(rows)} 节点 → {path}")
 
 
-def show_stability(st: dict):
-    nodes = [n for n in st["nodes"].values() if n.get("present")]
+def show_stability(st: dict, args):
+    nodes = [n for n in st["nodes"].values()
+             if n.get("present") and not provider_excluded(n, args)]
     if not nodes:
-        console.print("[yellow]state 中没有在场节点[/yellow]")
+        console.print("[yellow]state 中没有可展示的在场节点(可能全部被排除)[/yellow]")
         return
     mean = lambda xs: sum(xs) / len(xs) if xs else None
     pct = lambda v: f"{v*100:.0f}%" if v is not None else "-"
@@ -1524,6 +2070,15 @@ def _ps(script: str) -> subprocess.CompletedProcess:
             pass
 
 
+def append_provider_args(argv: list[str], args) -> list[str]:
+    """把 --provider / --exclude-provider 原样带入定时任务命令行。"""
+    if args.provider:
+        argv += ["--provider", args.provider]
+    for name in (getattr(args, "exclude_provider", None) or []):
+        argv += ["--exclude-provider", name]
+    return argv
+
+
 def _psq(s: str) -> str:
     return "'" + str(s).replace("'", "''") + "'"
 
@@ -1556,6 +2111,7 @@ def install_task_windows(args):
             "--out-dir", str(outdir), "--out-tiers", tiers, "-c", str(conc)]
     if args.mihomo:
         argv += ["--mihomo", str(args.mihomo)]
+    append_provider_args(argv, args)
     #  if args.no_stability_sample:
         #  argv += ["--no-stability-sample"]
     #  if args.stability_only:
@@ -1718,6 +2274,7 @@ def install_task_linux(args):
             "--out-dir", str(outdir), "--out-tiers", tiers, "-c", str(conc)]
     if args.mihomo:
         argv += ["--mihomo", str(args.mihomo)]
+    append_provider_args(argv, args)
     if refresh:
         argv += ["--refresh-subs"]
 
@@ -1883,7 +2440,7 @@ class RunLock:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="ai_clean.py",
-        description="AI 干净节点筛选器 v3 —— 解锁一次性增量探测 + 周期性健康采样 + IP 纯净度(IPQS)",
+        description="AI 干净节点筛选器 v3 —— 解锁一次性增量探测 + 周期性健康采样 + IP 纯净度(IPQS/ipapi.is/AbuseIPDB)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""推荐工作流示例:
   1) 一次性: 从现有 Clash 配置提取订阅清单
@@ -1901,8 +2458,9 @@ def build_parser() -> argparse.ArgumentParser:
      python ai_clean.py --subs subs.txt --out-tiers t1,t2,t3 --no-stability-sample
      python ai_clean.py --subs subs.txt --out-tiers t1,t2,t3 --provider 某机场
 
-  5) IP 纯净度(节点内取出口IP → 直连查 IPQS; key 也可放环境变量 IPQS_KEY)
-     python ai_clean.py --subs subs.txt --ipqs-only --limit 50 --stats-out ipqs.csv
+  5) IP 纯净度(取出口IP → 直连查 IPQS + 可选 ipapi.is / AbuseIPDB; key 可放环境变量)
+     python ai_clean.py --subs subs.txt --ipqs-only --ipqs-min-tier 2 --stats-out ipqs.csv
+     python ai_clean.py --subs subs.txt --ipqs --no-stability-sample --ipqs-min-tier 2
      python ai_clean.py --subs subs.txt --ipqs-only --ipqs-refresh --ipqs-block-above 90
 
   6) 离线查看 / 输出
@@ -1912,6 +2470,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 其他常用:
   python ai_clean.py --subs subs.txt --refresh-subs --sub-cookie "cf_clearance=..."
+  python ai_clean.py --emit-only --out-tiers t1,t2,t3 --exclude-provider 某机场
   python ai_clean.py --subs subs.txt --force-unlock --provider 某机场
   python ai_clean.py --subs subs.txt --reset-stats
 
@@ -1939,6 +2498,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--extra-exclude", default=None, help="追加过滤词(逗号分隔)")
     g.add_argument("--no-name-filter", action="store_true", help="关闭节点名关键词过滤")
     g.add_argument("--provider", metavar="NAME", help="只处理该机场的节点")
+    g.add_argument("--exclude-provider", action="append", default=[], metavar="NAME",
+                   help="输出与报告中排除的机场(可多次或逗号分隔)")
     g.add_argument("--limit", type=int, default=0, metavar="N",
                    help="本轮最多处理 N 个节点(0=不限; 控制 IPQS 配额时很有用)")
 
@@ -1958,11 +2519,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只测稳定性/延迟(204+失败时 Apple 兜底), 跳过解锁, 不改档不封盘")
     g.add_argument("--reset-stats", action="store_true", help="清零健康统计(保留解锁结论), 开启全新统计窗口")
 
-    g = ap.add_argument_group("IP 纯净度 (IPQualityScore)")
+    g = ap.add_argument_group("IP 纯净度 (IPQS + ipapi.is + AbuseIPDB)")
     g.add_argument("--ipqs", action="store_true", help="本轮顺带做 IP 纯净度查询(已查成功的跳过)")
-    g.add_argument("--ipqs-only", action="store_true", help="只做 IP 纯净度(取出口IP+查IPQS), 跳过解锁与健康采样")
+    g.add_argument("--ipqs-only", action="store_true", help="只做 IP 纯净度(取出口IP+直连评分), 跳过解锁与健康采样")
     g.add_argument("--ipqs-key", default=None, metavar="KEY", help="IPQS API key(也可用环境变量 IPQS_KEY)")
-    g.add_argument("--ipqs-refresh", action="store_true", help="强制重新取出口IP并重查 IPQS(默认复用已成功记录)")
+    g.add_argument("--ipapi-key", default=None, metavar="KEY",
+                   help="ipapi.is API key(可选, 环境变量 IPAPI_KEY; 查 ASN/机房滥用率)")
+    g.add_argument("--abuseipdb-key", default=None, metavar="KEY",
+                   help="AbuseIPDB API key(可选, 环境变量 ABUSEIPDB_KEY; 查近期攻击举报)")
+    g.add_argument("--ipqs-min-tier", type=int, default=0, choices=[0, 1, 2, 3], metavar="0-3",
+                   help="只对 tier>=N 的节点查 IP 纯净度(默认 0=全部未封盘; 可设 2/3 专筛 T2/T3)")
+    g.add_argument("--ipqs-refresh", action="store_true", help="强制重新取出口IP并重查(默认复用已成功记录)")
     g.add_argument("--ipqs-strictness", type=int, default=1, metavar="0-3",
                    help="IPQS 严格度(默认 1; 官方建议 0/1, 2+ 很严格易误报)")
     g.add_argument("--ipqs-interval", type=float, default=1.5, metavar="SEC",
@@ -2001,10 +2568,19 @@ def main() -> int:
     if args.stability_only and args.no_stability_sample:
         console.print("[red]--stability-only 与 --no-stability-sample 互斥[/red]")
         return 1
-    # [IPQS] 护栏: 参数已定义但功能未实现, 防止误跑成普通解锁轮
-    if getattr(args, "ipqs", False) or getattr(args, "ipqs_only", False):
-        console.print("[red]IPQS 功能尚未实现(见文件头【AI-HANDOFF】TODO)，--ipqs* 参数暂不可用[/red]")
+    # [IPQS] 规范化与互斥校验
+    if args.ipqs_only:
+        args.ipqs = True
+    if args.ipqs_only and args.stability_only:
+        console.print("[red]--ipqs-only 与 --stability-only 互斥[/red]")
         return 1
+    args.ipqs_key = (args.ipqs_key or os.environ.get("IPQS_KEY") or "").strip() or None
+    args.ipapi_key = (args.ipapi_key or os.environ.get("IPAPI_KEY") or "").strip() or None
+    args.abuseipdb_key = (args.abuseipdb_key or os.environ.get("ABUSEIPDB_KEY") or "").strip() or None
+    if not (0 <= args.ipqs_strictness <= 3):
+        console.print("[red]--ipqs-strictness 必须在 0..3 之间[/red]")
+        return 1
+    args.ipqs_interval = max(0.0, float(args.ipqs_interval))
 
     if args.refresh_only:
         args.refresh_subs = True          # --refresh-only 隐含 --refresh-subs
@@ -2013,6 +2589,7 @@ def main() -> int:
         args.concurrency = MAX_CONCURRENCY
     args.concurrency = max(1, args.concurrency)
     args.blocked_regions = [x.strip().upper() for x in split_kw(args.blocked_regions)]
+    args.exclude_providers = [p for v in args.exclude_provider for p in split_kw(v)]
     try:
         tiers = parse_tiers(args.out_tiers)
     except ValueError as e:
@@ -2042,9 +2619,11 @@ def main() -> int:
     if args.status:
         show_status(st, args)
         if args.stability_only:
-            show_stability(st)
+            show_stability(st, args)
+        if args.ipqs or any_ip_purity_data(st):          # [IPQS]
+            show_ipqs(st, args)
         if args.stats_out:
-            dump_stats(st, args.stats_out)
+            dump_stats(st, args.stats_out, args)
         return 0
 
     if args.emit_only:
@@ -2093,17 +2672,31 @@ def main() -> int:
         if args.extra_exclude:
             keywords += split_kw(args.extra_exclude)
 
+    if args.ipqs and not args.refresh_only and not args.ipqs_key:   # [IPQS]
+        console.print("[red]启用 --ipqs/--ipqs-only 需要提供 --ipqs-key 或设置环境变量 IPQS_KEY[/red]")
+        try:
+            _LOG_FH.close()
+        except Exception:
+            pass
+        return 1
+
     if args.refresh_only:
         exe, ver = "(未启动)", "只刷新订阅模式(不需要内核)"
     else:
         exe, ver = find_mihomo(args.mihomo)
+    ip_engs = [name for name, ok in (("IPQS", args.ipqs_key), ("ipapi.is", args.ipapi_key),
+                                     ("AbuseIPDB", args.abuseipdb_key)) if ok]
+    ip_line = (f"\nIP纯净度: {' + '.join(ip_engs)} | min-tier=T{args.ipqs_min_tier}"
+               f" | 间隔={args.ipqs_interval}s | 刷新={'是' if args.ipqs_refresh else '否'}") if args.ipqs else ""
     console.print(Panel.fit(
         f"[bold]AI 干净节点筛选器 v3[/bold]\n内核: {exe}\n版本: {ver}\n"
         f"T1 {TIER_DESC[1]}\nT2 {TIER_DESC[2]}\nT3 {TIER_DESC[3]}\n"
         #  f"并发 {args.concurrency}(上限3) | 批次 {args.batch_size} | 超时 {args.timeout}s | 订阅 {len(subs)}\n"
         f"并发 {args.concurrency}(上限3) | 批次 {args.batch_size} | 超时 {args.timeout}s | "
         f"节点池{'刷新订阅' if args.refresh_subs else '缓存'}({len(subs)}订阅)\n"
-        f"名称过滤 {len(keywords)} 词 | 送中判定 {','.join(args.blocked_regions)} | 输出 {args.out_tiers}",
+        f"名称过滤 {len(keywords)} 词 | 送中判定 {','.join(args.blocked_regions)} | 输出 {args.out_tiers}"
+        + (f" | 排除机场(仅输出/报告) {','.join(args.exclude_providers)}" if args.exclude_providers else "")
+        + ip_line,
         border_style="cyan"))
 
     try:
@@ -2238,26 +2831,43 @@ def run_round(st, subs, keywords, exe, ver, tiers, args) -> int:
 
     if args.provider:
         targets = [n for n in targets if n["provider"] == args.provider]
+    if args.ipqs_only:                                  # [IPQS]
+        targets = [n for n in targets if ipqs_pending(n, args)]
     if args.limit > 0:
         targets = targets[:args.limit]
-    #  if not targets:
-        #  console.print("[yellow]没有可测节点(全部封盘或订阅为空)，仅重新生成 yaml[/yellow]")
-        #  emit(st, tiers, args.out_dir, args)
-        #  save_state(st, args.state)
-        #  return 2
+
+    if args.ipqs and args.ipqs_block_above is not None and not targets:   # [IPQS]
+        for n in st["nodes"].values():
+            if n["present"] and not n["blocked"] and (not args.provider or n["provider"] == args.provider):
+                maybe_ipqs_block(n, args)
 
     if not targets:
+        if args.ipqs_only:                              # [IPQS]
+            console.print("[green]没有待查 IP 纯净度的节点(均已完成或不符合 --ipqs-min-tier)[/green]")
+            if args.stats_out:
+                dump_stats(st, args.stats_out, args)
+            show_ipqs(st, args)
+            if args.ipqs_block_above is not None:
+                emit(st, tiers, args.out_dir, args)
+            save_state(st, args.state)
+            return 0
         console.print("[yellow]没有可测节点(全部封盘或订阅为空)，仅重新生成 yaml[/yellow]")
         emit(st, tiers, args.out_dir, args)
         save_state(st, args.state)
         return 2
 
+    if args.ipqs:                                       # [IPQS]
+        reset_ip_run_ctx(st, args)
+        lip = _IP_RUN_CTX.get("local_ip")
+        console.print(f"[dim]本机直连 IP 基线: {lip or '(未取得)'}[/dim]")
 
-    #  n_unlock = sum(1 for n in targets if unlock_pending(n))
-    n_unlock = 0 if args.stability_only else sum(1 for n in targets if unlock_pending(n))
+    n_unlock = 0 if (args.stability_only or args.ipqs_only) else sum(1 for n in targets if unlock_pending(n))
+    n_stab = 0 if (args.no_stability_sample or args.ipqs_only) else len(targets)
+    n_ipqs = sum(1 for n in targets if ipqs_pending(n, args)) if args.ipqs else 0
 
     console.print(f"待处理 [bold]{len(targets)}[/bold] 个节点：解锁增量 {n_unlock}，"
-                  f"健康采样 {0 if args.no_stability_sample else len(targets)}\n")
+                  f"健康采样 {n_stab}"
+                  + (f"，IP纯净度 {n_ipqs}" if args.ipqs else "") + "\n")
 
     # ---- 分批测试 ----
     workdir = Path(tempfile.mkdtemp(prefix="ai-clean-"))
@@ -2273,18 +2883,20 @@ def run_round(st, subs, keywords, exe, ver, tiers, args) -> int:
             def on_done(n):
                 with lock:
                     done[0] += 1
-                    t1 = sum(1 for x in targets if x["tier"] >= 1)
-                    t2 = sum(1 for x in targets if x["tier"] >= 2)
-                    t3 = sum(1 for x in targets if x["tier"] >= 3)
                     bk = sum(1 for x in targets if x["blocked"])
-                    prog.update(task, advance=1,
-                                description=f"T1:{t1} T2:{t2} T3:{t3} 封盘:{bk}")
+                    if args.ipqs_only:
+                        iq_ok = sum(1 for x in targets if (x.get("ipqs") or {}).get("ok"))
+                        desc = f"IP完成:{iq_ok} 封盘:{bk}"
+                    else:
+                        t1 = sum(1 for x in targets if x["tier"] >= 1)
+                        t2 = sum(1 for x in targets if x["tier"] >= 2)
+                        t3 = sum(1 for x in targets if x["tier"] >= 3)
+                        desc = f"T1:{t1} T2:{t2} T3:{t3} 封盘:{bk}"
+                    prog.update(task, advance=1, description=desc)
 
             for bi, batch in enumerate(batches, 1):
                 console.print(f"[dim]批次 {bi}/{len(batches)}: {len(batch)} 节点, "
-                              #  f"{sum(1 for n in batch if needs_listener(n))} 个 listener[/dim]")
-                              #  f"{sum(1 for n in batch if needs_listener(n, args))} 个 listener[/dim]")
-                          f"{sum(1 for n in batch if needs_listener(n, args))} 个 listener[/dim]")
+                              f"{sum(1 for n in batch if needs_listener(n, args))} 个 listener[/dim]")
                 run_batch(batch, args, exe, workdir, on_done, budget=[25])
                 save_state(st, args.state)          # 每批落盘，崩溃安全
     finally:
@@ -2294,14 +2906,12 @@ def run_round(st, subs, keywords, exe, ver, tiers, args) -> int:
         else:
             shutil.rmtree(workdir, ignore_errors=True)
 
-    #  for n in st["nodes"].values():
-        #  n["port"] = None
-        #  if n["present"]:
-            #  finalize(n)
-
     for n in st["nodes"].values():
         n["port"] = None
-        if n["present"] and not args.stability_only:
+        if n["present"] and args.ipqs and args.ipqs_block_above is not None:   # [IPQS]
+            if not args.provider or n["provider"] == args.provider:
+                maybe_ipqs_block(n, args)
+        if n["present"] and not args.stability_only and not args.ipqs_only:
             finalize(n)
 
     st["runs"].append({"at": now_str(), "seconds": round(time.time() - t_start),
@@ -2310,22 +2920,30 @@ def run_round(st, subs, keywords, exe, ver, tiers, args) -> int:
                        "t2": sum(1 for n in targets if n["tier"] >= 2),
                        "t3": sum(1 for n in targets if n["tier"] >= 3)})
 
-    #  st["runs"] = st["runs"][-200:]
-    #  save_state(st, args.state)
-    #  written = emit(st, tiers, args.out_dir, args)
-    #  show_status(st, args)
-
     st["runs"] = st["runs"][-200:]
     save_state(st, args.state)
     if args.stats_out:
-        dump_stats(st, args.stats_out)
+        dump_stats(st, args.stats_out, args)
     if args.stability_only:
-        show_stability(st)
+        show_stability(st, args)
+        if args.ipqs:                                   # [IPQS]
+            show_ipqs(st, args)
         console.print(f"[dim]纯稳定性模式：未动解锁/tier/封盘，未生成yaml。"
+                      f"耗时 {time.time()-t_start:.0f}s[/dim]")
+        return 0
+    if args.ipqs_only:                                  # [IPQS]
+        show_ipqs(st, args)
+        if args.ipqs_block_above is not None:
+            written = emit(st, tiers, args.out_dir, args)
+            for t, (p, cnt) in written.items():
+                console.print(f"[green]T{t}[/green] {cnt:4d} 节点 → {p}")
+        console.print(f"[dim]纯 IP 纯净度模式：未动解锁/tier(--ipqs-block-above 除外)。"
                       f"耗时 {time.time()-t_start:.0f}s[/dim]")
         return 0
     written = emit(st, tiers, args.out_dir, args)
     show_status(st, args)
+    if args.ipqs:                                       # [IPQS]
+        show_ipqs(st, args)
 
     tw = Table(title=f"输出 (耗时 {time.time()-t_start:.0f}s)", box=box.SIMPLE_HEAVY)
     tw.add_column("档")
